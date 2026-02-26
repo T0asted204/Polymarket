@@ -1,0 +1,951 @@
+// ═══════════════════════════════════════════════════════════════════
+// Polymarket-7.4.1-MR-3O-R-ZW-AP  (Strategy + Preview + Volume Expansion)
+// Mean Reversion + Third-Order Markov + Weighted Regime +
+// Volume Filter + Volume Expansion Filter + Regime Transitions +
+// Wilson CI + Bayesian Prior + Regime Background + Bar-Color Stats
+// + Next-Bar Preview + Strategy Execution (SL/TP-Only Exits)
+// ═══════════════════════════════════════════════════════════════════
+//@version=6
+strategy("Polymarket-7.4.1-MR-3O-R-ZW-AP (Strategy)", overlay=true, max_bars_back=5000, pyramiding=0, calc_on_every_tick=true, process_orders_on_close=false)
+
+// ═══════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════
+
+// --- Mean Reversion ---
+rma_len = input.int(12,    "RMA Length",                   minval=1,   group="Mean Reversion")
+atr_len = input.int(24,   "ATR Length",                   minval=1,   group="Mean Reversion")
+
+// --- Third-Order Transitions ---
+min_seq_n   = input.int(10,      "Min Samples per Sequence",  minval=1,    group="Third-Order")
+min_winrate = input.float(52.0, "Base Min Winrate % to Bet", minval=50.0, step=0.5, group="Third-Order")
+
+// ② Adaptive Winrate
+enable_adaptive_wr = input.bool(true,  "Adaptive Winrate (scales with regime)", group="Adaptive WR")
+adaptive_wr_boost  = input.float(2.0,  "Extra % added in HH regime",            minval=0.0, step=0.5, group="Adaptive WR")
+adaptive_wr_cut    = input.float(0.5,  "% removed in LL regime",                minval=0.0, step=0.5, group="Adaptive WR")
+
+// --- Volatility Regime ---
+enable_regime    = input.bool(true,  "Enable Vol Regime Filter",             group="Regime")
+regime_lookback  = input.int(288,     "ATR Percentile Lookback",              minval=10,  group="Regime")
+regime_pctile    = input.float(85.0, "High-Vol Percentile",                  minval=1.0, step=1.0, group="Regime")
+enable_regime_tx = input.bool(true,  "Use Regime Transitions (108 buckets)", group="Regime")
+show_regime_bg   = input.bool(true,  "Highlight Bars by Regime",             group="Regime")
+
+// --- Weighted Regime Probability ---
+enable_weighted = input.bool(true, "Weighted Regime+Combined Prob", group="Weighting")
+
+// ① Magnitude Weighting
+enable_mag_weight = input.bool(true,  "Magnitude-Weighted Sequences",               group="Magnitude Weight")
+mag_cap           = input.float(10,  "ATR-multiple cap (avoids outlier dominance)", minval=1.0, step=0.25, group="Magnitude Weight")
+
+// --- Volume Percentile Filter ---
+enable_vol_filter = input.bool(false, "Enable Volume Filter",         group="Volume Filter")
+vol_lookback      = input.int(250,   "Volume Percentile Lookback",   minval=5,   group="Volume Filter")
+vol_pctile        = input.float(1.0, "Min Volume Percentile",        minval=1.0, step=1.0, group="Volume Filter")
+
+// --- Wilson CI Filter ---
+enable_wilson = input.bool(true,  "Wilson Lower-Bound Filter",              group="Wilson CI")
+wilson_z      = input.float(1.64, "Wilson z-score (1.64 = 90% CI)",        minval=0.5, maxval=4.0, step=0.1, group="Wilson CI")
+
+// ⑤ Bayesian Prior
+enable_prior   = input.bool(true,  "Bayesian Prior Smoothing (small N)",       group="Prior Smoothing")
+prior_strength = input.float(10.0, "Prior Strength (higher = more shrinkage)", minval=1.0, step=1.0, group="Prior Smoothing")
+
+// --- Volume Expansion Filter ---
+enable_vol_exp   = input.bool(true,   "Enable Volume Expansion Filter",           group="Volume Expansion")
+vol_ma_len       = input.int(20,      "Volume MA Length",                          minval=5,   group="Volume Expansion")
+vol_mult_thresh  = input.float(1.4,   "Volume Multiplier Threshold",              step=0.05, minval=1.0, group="Volume Expansion",
+     tooltip="Blocks trades when volume / SMA(volume, vol_ma_len) >= threshold")
+vol_z_len        = input.int(288,     "Volume Z-Score Length",                     minval=20,  group="Volume Expansion")
+use_vol_z        = input.bool(true,  "Use Volume Z-Score Instead of Multiplier", group="Volume Expansion")
+vol_z_thresh     = input.float(1.5,   "Volume Z Threshold",                       step=0.1, minval=0.0, group="Volume Expansion")
+show_vol_exp_bg  = input.bool(true,  "Highlight Volume Expansion Bars",          group="Volume Expansion")
+
+// --- Stop Loss / Take Profit ---
+sl_atr_mult   = input.float(1.0,  "Stop Loss (ATR multiplier)",    minval=0.1, step=0.1, group="SL / TP")
+tp_atr_mult   = input.float(1.0,  "Take Profit (ATR multiplier)",  minval=0.1, step=0.1, group="SL / TP")
+
+// --- Bar Colour Gates ---
+// Independently enable/disable betting LONG or SHORT after a green or red prior bar.
+allow_after_green_long  = input.bool(true, "Allow LONG  after green bar",  group="Bar Colour Gates")
+allow_after_green_short = input.bool(true, "Allow SHORT after green bar",  group="Bar Colour Gates")
+allow_after_red_long    = input.bool(true, "Allow LONG  after red bar",    group="Bar Colour Gates")
+allow_after_red_short   = input.bool(true, "Allow SHORT after red bar",    group="Bar Colour Gates")
+
+// --- Regime Gates ---
+// Enable / disable filtered bets per regime, and optionally FORCE a trade on
+// every bar in that regime (bypasses Wilson, vol, min-N — uses raw Markov direction).
+allow_regime_ll = input.bool(true,  "Allow filtered bets in LL regime",          group="Regime Gates")
+allow_regime_lh = input.bool(true,  "Allow filtered bets in LH regime",          group="Regime Gates")
+allow_regime_hl = input.bool(true,  "Allow filtered bets in HL regime",          group="Regime Gates")
+allow_regime_hh = input.bool(true,  "Allow filtered bets in HH regime",          group="Regime Gates")
+force_regime_ll = input.bool(false, "Force trade every bar in LL (bypass filters)", group="Regime Gates")
+force_regime_lh = input.bool(false, "Force trade every bar in LH (bypass filters)", group="Regime Gates")
+force_regime_hl = input.bool(false, "Force trade every bar in HL (bypass filters)", group="Regime Gates")
+force_regime_hh = input.bool(false, "Force trade every bar in HH (bypass filters)", group="Regime Gates")
+
+// --- Display ---
+show_stats   = input.bool(true, "Show Stats Panel",        group="Display")
+show_arrows  = input.bool(true, "Show Prediction Arrows",  group="Display")
+show_preview = input.bool(true, "Show Next-Bar Preview",   group="Display")
+
+// --- Winrate window ---
+wr_window = input.int(1000, "Winrate window (bets)", minval=1, group="Stats")
+
+// ═══════════════════════════════════════════════════════════
+// 1. BASE MEAN-REVERSION SIGNAL
+// ═══════════════════════════════════════════════════════════
+
+float rma_v = ta.rma(close, rma_len)
+float atr_v = ta.atr(atr_len)
+
+// +1 = bullish MR   -1 = bearish MR   0 = neutral
+int mr = close > rma_v + atr_v ? 1 : (close < rma_v - atr_v ? -1 : 0)
+
+// ═══════════════════════════════════════════════════════════
+// 2. VOLATILITY REGIME & REGIME TRANSITION
+// ═══════════════════════════════════════════════════════════
+
+float atr_ptile = ta.percentile_nearest_rank(atr_v, regime_lookback, regime_pctile)
+int   vol_reg   = atr_v > atr_ptile ? 1 : 0     // 1 = high-vol, 0 = low-vol
+
+int prev_reg = nz(vol_reg[2])
+int curr_reg = nz(vol_reg[1])
+
+// Regime transition index: prev→curr  LL=0  LH=1  HL=2  HH=3
+int rt = prev_reg * 2 + curr_reg
+
+// ② ADAPTIVE MIN WINRATE
+float effective_min_wr = min_winrate
+if enable_adaptive_wr
+    if rt == 3
+        effective_min_wr := min_winrate + adaptive_wr_boost
+    else if rt == 0
+        effective_min_wr := math.max(50.1, min_winrate - adaptive_wr_cut)
+    else
+        effective_min_wr := min_winrate
+
+// ═══════════════════════════════════════════════════════════
+// 3. VOLUME PERCENTILE
+// ═══════════════════════════════════════════════════════════
+
+float vol_ptile_val = ta.percentile_nearest_rank(volume, vol_lookback, vol_pctile)
+bool  vol_ok        = not enable_vol_filter or (nz(volume[1]) > nz(vol_ptile_val[1]))
+
+// ═══════════════════════════════════════════════════════════
+// 3b. VOLUME EXPANSION FILTER
+// ═══════════════════════════════════════════════════════════
+
+float vol_ma       = ta.sma(volume, vol_ma_len)
+float vol_mult     = vol_ma > 0.0 ? volume / vol_ma : 0.0
+float vol_z_std    = ta.stdev(volume, vol_z_len)
+float vol_z_mean   = ta.sma(volume, vol_z_len)
+float vol_z        = vol_z_std > 0.0 ? (volume - vol_z_mean) / vol_z_std : 0.0
+
+bool allow_trade_vol = true
+if enable_vol_exp
+    if use_vol_z
+        allow_trade_vol := nz(vol_z[1]) < vol_z_thresh
+    else
+        allow_trade_vol := nz(vol_mult[1]) < vol_mult_thresh
+
+// ═══════════════════════════════════════════════════════════
+// 4. SEQUENCE TABLE & COUNTERS
+// ═══════════════════════════════════════════════════════════
+
+sig_to_i(s) => s == -1 ? 0 : (s == 0 ? 1 : 2)
+
+int s1 = nz(mr[1])
+int s2 = nz(mr[2])
+int s3 = nz(mr[3])
+int si = sig_to_i(s3) * 9 + sig_to_i(s2) * 3 + sig_to_i(s1)
+
+float prev_bar_move = math.abs(close[1] - close[2])
+float prev_bar_atr  = nz(atr_v[1], atr_v)
+float bar_weight    = enable_mag_weight
+     ? math.max(1.0, math.min(mag_cap, prev_bar_atr > 0.0 ? prev_bar_move / prev_bar_atr : 1.0))
+     : 1.0
+
+// Weighted float arrays (n = total weight, h = weight of "up" outcomes)
+var array<float> C_n  = array.new_float(27,  0.0)
+var array<float> C_h  = array.new_float(27,  0.0)
+var array<float> RT_n = array.new_float(108, 0.0)
+var array<float> RT_h = array.new_float(108, 0.0)
+
+int rti = si * 4 + rt
+
+// ═══════════════════════════════════════════════════════════
+// 4b. WILSON LOWER-BOUND HELPER
+// ═══════════════════════════════════════════════════════════
+
+wilson_lower(float p_hat, float n, float z) =>
+    float result = 0.0
+    if n < 1.0
+        result := 0.0
+    else
+        float z2     = z * z
+        float denom  = 1.0 + z2 / n
+        float center = p_hat + z2 / (2.0 * n)
+        float spread = z * math.sqrt(p_hat * (1.0 - p_hat) / n + z2 / (4.0 * n * n))
+        result := (center - spread) / denom
+    result
+
+// ═══════════════════════════════════════════════════════════
+// 5. PREDICTION  (uses weighted float counters)
+// ═══════════════════════════════════════════════════════════
+
+bool went_up   = close > close[1]
+bool went_down = close < close[1]
+
+float cn   = array.get(C_n, si)
+float chv  = array.get(C_h, si)
+float rtn  = enable_regime_tx and enable_regime ? array.get(RT_n, rti) : 0.0
+float rthv = enable_regime_tx and enable_regime ? array.get(RT_h, rti) : 0.0
+
+// ⑤ BAYESIAN PRIOR SMOOTHING
+float prior_p = 0.5
+
+float cpH_raw  = cn  > 0.0 ? chv  / cn  : prior_p
+float cpL_raw  = cn  > 0.0 ? (cn - chv) / cn  : prior_p
+float rtpH_raw = rtn > 0.0 ? rthv / rtn : prior_p
+float rtpL_raw = rtn > 0.0 ? (rtn - rthv) / rtn : prior_p
+
+float cpH  = enable_prior ? (cn  * cpH_raw  + prior_strength * prior_p) / (cn  + prior_strength) : cpH_raw
+float cpL  = enable_prior ? (cn  * cpL_raw  + prior_strength * prior_p) / (cn  + prior_strength) : cpL_raw
+float rtpH = enable_prior ? (rtn * rtpH_raw + prior_strength * prior_p) / (rtn + prior_strength) : rtpH_raw
+float rtpL = enable_prior ? (rtn * rtpL_raw + prior_strength * prior_p) / (rtn + prior_strength) : rtpL_raw
+
+cpH  := cpH  * 100.0
+cpL  := cpL  * 100.0
+rtpH := rtpH * 100.0
+rtpL := rtpL * 100.0
+
+float eH = na
+float eL = na
+float eN = 0.0
+
+if enable_weighted and enable_regime and enable_regime_tx
+    float tN = rtn + cn
+    eN := tN
+    if tN > 0.001
+        eH := (rtn * rtpH + cn * cpH) / tN
+        eL := (rtn * rtpL + cn * cpL) / tN
+    else
+        eH := 50.0
+        eL := 50.0
+else if enable_regime and enable_regime_tx and rtn >= float(min_seq_n)
+    eN := rtn
+    eH := rtpH
+    eL := rtpL
+else
+    eN := cn
+    eH := cpH
+    eL := cpL
+
+float eBest      = math.max(eH, eL)
+float eBest_prop = eBest / 100.0
+float wilson_lb  = wilson_lower(eBest_prop, eN, wilson_z) * 100.0
+
+bool ok_n   = eN >= float(min_seq_n)
+bool ok_wr  = enable_wilson ? wilson_lb >= effective_min_wr : eBest >= effective_min_wr
+bool ok_vol = vol_ok
+
+// ── Regime gate ──────────────────────────────────────────────────
+// Which regimes allow filtered bets?
+bool regime_gate = switch rt
+    0 => allow_regime_ll
+    1 => allow_regime_lh
+    2 => allow_regime_hl
+    3 => allow_regime_hh
+    => true
+
+// Force-trade flag: ignore ALL filters, just follow core Markov direction.
+bool force_this = switch rt
+    0 => force_regime_ll
+    1 => force_regime_lh
+    2 => force_regime_hl
+    3 => force_regime_hh
+    => false
+
+// Core Markov direction — derived purely from accumulated probabilities,
+// used for both filtered and forced bets.
+string markov_dir = nz(eH, 50.0) >= nz(eL, 50.0) ? "LONG" : "SHORT"
+
+// ── Bar-colour gate (filtered bets only) ─────────────────────────
+bool prev_green_bar = close[1] > close[2]
+bool prev_red_bar   = close[1] < close[2]
+
+bool bar_color_ok = true
+if prev_green_bar
+    bar_color_ok := (markov_dir == "LONG"  and allow_after_green_long)
+         or        (markov_dir == "SHORT" and allow_after_green_short)
+else if prev_red_bar
+    bar_color_ok := (markov_dir == "LONG"  and allow_after_red_long)
+         or        (markov_dir == "SHORT" and allow_after_red_short)
+
+// ── Final bet decision ────────────────────────────────────────────
+// filtered_bet: passes all filters + regime gate + bar-colour gate
+// forced_bet:   current regime has force enabled — skips every filter
+bool filtered_bet = ok_n and ok_wr and ok_vol and regime_gate and bar_color_ok and allow_trade_vol
+bool forced_bet   = force_this
+bool bet          = filtered_bet or forced_bet
+
+string dir  = bet ? markov_dir : na
+float  prob = bet ? eBest : na
+
+// ═══════════════════════════════════════════════════════════
+// 5b. NEXT-BAR PREVIEW
+//     Pretend the current (live) bar is already closed.
+//     Shift the 3rd-order Markov sequence forward by one bar,
+//     recompute regime, filters, and show the hypothetical
+//     signal for the NEXT bar.  Updates tick-by-tick.
+// ═══════════════════════════════════════════════════════════
+
+// Sequence: current bar's mr becomes s1, shift the rest back
+int pv_s1 = mr              // live close → treated as confirmed
+int pv_s2 = nz(mr[1])       // was s1
+int pv_s3 = nz(mr[2])       // was s2
+int pv_si = sig_to_i(pv_s3) * 9 + sig_to_i(pv_s2) * 3 + sig_to_i(pv_s1)
+
+// Regime: shift forward — previous=current curr_reg, current=live vol_reg
+int pv_prev_reg = nz(vol_reg[1])   // was curr_reg
+int pv_curr_reg = vol_reg           // live bar's regime
+int pv_rt       = pv_prev_reg * 2 + pv_curr_reg
+
+// Index into regime-transition counters
+int pv_rti = pv_si * 4 + pv_rt
+
+// Adaptive winrate for preview regime
+float pv_eff_min_wr = min_winrate
+if enable_adaptive_wr
+    if pv_rt == 3
+        pv_eff_min_wr := min_winrate + adaptive_wr_boost
+    else if pv_rt == 0
+        pv_eff_min_wr := math.max(50.1, min_winrate - adaptive_wr_cut)
+
+// Volume: for next bar, "previous volume" = current bar's volume
+bool pv_vol_ok = not enable_vol_filter or (volume > vol_ptile_val)
+
+// Volume expansion: for next bar, "previous bar" = current bar
+bool pv_allow_trade_vol = true
+if enable_vol_exp
+    if use_vol_z
+        pv_allow_trade_vol := vol_z < vol_z_thresh
+    else
+        pv_allow_trade_vol := vol_mult < vol_mult_thresh
+
+// Look up Markov counters for the preview sequence
+float pv_cn   = array.get(C_n, pv_si)
+float pv_chv  = array.get(C_h, pv_si)
+float pv_rtn  = enable_regime_tx and enable_regime ? array.get(RT_n, pv_rti) : 0.0
+float pv_rthv = enable_regime_tx and enable_regime ? array.get(RT_h, pv_rti) : 0.0
+
+// Bayesian prior
+float pv_cpH_raw  = pv_cn  > 0.0 ? pv_chv  / pv_cn  : prior_p
+float pv_cpL_raw  = pv_cn  > 0.0 ? (pv_cn - pv_chv) / pv_cn  : prior_p
+float pv_rtpH_raw = pv_rtn > 0.0 ? pv_rthv / pv_rtn : prior_p
+float pv_rtpL_raw = pv_rtn > 0.0 ? (pv_rtn - pv_rthv) / pv_rtn : prior_p
+
+float pv_cpH  = enable_prior ? (pv_cn  * pv_cpH_raw  + prior_strength * prior_p) / (pv_cn  + prior_strength) : pv_cpH_raw
+float pv_cpL  = enable_prior ? (pv_cn  * pv_cpL_raw  + prior_strength * prior_p) / (pv_cn  + prior_strength) : pv_cpL_raw
+float pv_rtpH = enable_prior ? (pv_rtn * pv_rtpH_raw + prior_strength * prior_p) / (pv_rtn + prior_strength) : pv_rtpH_raw
+float pv_rtpL = enable_prior ? (pv_rtn * pv_rtpL_raw + prior_strength * prior_p) / (pv_rtn + prior_strength) : pv_rtpL_raw
+
+pv_cpH  := pv_cpH  * 100.0
+pv_cpL  := pv_cpL  * 100.0
+pv_rtpH := pv_rtpH * 100.0
+pv_rtpL := pv_rtpL * 100.0
+
+float pv_eH = na
+float pv_eL = na
+float pv_eN = 0.0
+
+if enable_weighted and enable_regime and enable_regime_tx
+    float pv_tN = pv_rtn + pv_cn
+    pv_eN := pv_tN
+    if pv_tN > 0.001
+        pv_eH := (pv_rtn * pv_rtpH + pv_cn * pv_cpH) / pv_tN
+        pv_eL := (pv_rtn * pv_rtpL + pv_cn * pv_cpL) / pv_tN
+    else
+        pv_eH := 50.0
+        pv_eL := 50.0
+else if enable_regime and enable_regime_tx and pv_rtn >= float(min_seq_n)
+    pv_eN := pv_rtn
+    pv_eH := pv_rtpH
+    pv_eL := pv_rtpL
+else
+    pv_eN := pv_cn
+    pv_eH := pv_cpH
+    pv_eL := pv_cpL
+
+float pv_eBest      = math.max(pv_eH, pv_eL)
+float pv_eBest_prop = pv_eBest / 100.0
+float pv_wilson_lb  = wilson_lower(pv_eBest_prop, pv_eN, wilson_z) * 100.0
+
+bool pv_ok_n   = pv_eN >= float(min_seq_n)
+bool pv_ok_wr  = enable_wilson ? pv_wilson_lb >= pv_eff_min_wr : pv_eBest >= pv_eff_min_wr
+bool pv_ok_vol = pv_vol_ok
+
+// Preview regime gate
+bool pv_regime_gate = switch pv_rt
+    0 => allow_regime_ll
+    1 => allow_regime_lh
+    2 => allow_regime_hl
+    3 => allow_regime_hh
+    => true
+
+// Preview force-trade flag
+bool pv_force_this = switch pv_rt
+    0 => force_regime_ll
+    1 => force_regime_lh
+    2 => force_regime_hl
+    3 => force_regime_hh
+    => false
+
+// Preview Markov direction
+string pv_markov_dir = nz(pv_eH, 50.0) >= nz(pv_eL, 50.0) ? "LONG" : "SHORT"
+
+// Preview bar-colour gate: for the next bar, the "previous bar" is the current bar
+bool pv_prev_green = close > close[1]   // current bar is green
+bool pv_prev_red   = close < close[1]   // current bar is red
+
+bool pv_bar_color_ok = true
+if pv_prev_green
+    pv_bar_color_ok := (pv_markov_dir == "LONG"  and allow_after_green_long)
+         or           (pv_markov_dir == "SHORT" and allow_after_green_short)
+else if pv_prev_red
+    pv_bar_color_ok := (pv_markov_dir == "LONG"  and allow_after_red_long)
+         or           (pv_markov_dir == "SHORT" and allow_after_red_short)
+
+// Preview final decision
+bool pv_filtered_bet = pv_ok_n and pv_ok_wr and pv_ok_vol and pv_regime_gate and pv_bar_color_ok and pv_allow_trade_vol
+bool pv_forced_bet   = pv_force_this
+bool pv_bet          = pv_filtered_bet or pv_forced_bet
+
+string pv_dir  = pv_bet ? pv_markov_dir : na
+float  pv_prob = pv_bet ? pv_eBest : na
+
+// Preview "why not" reason
+string pv_no_reason = ""
+if not pv_bet
+    if pv_force_this
+        pv_no_reason := ""   // shouldn't happen
+    else if not pv_ok_n
+        pv_no_reason := "Low samples"
+    else if not pv_ok_wr
+        pv_no_reason := enable_wilson ? "Wilson < " + str.tostring(pv_eff_min_wr, "#.##") : "Low winrate"
+    else if not pv_ok_vol
+        pv_no_reason := "Low volume"
+    else if not pv_allow_trade_vol
+        pv_no_reason := "Vol expansion"
+    else if not pv_regime_gate
+        pv_no_reason := "Regime blocked"
+    else if not pv_bar_color_ok
+        pv_no_reason := "Bar-colour gate"
+    else
+        pv_no_reason := "No signal"
+
+// ═══════════════════════════════════════════════════════════
+// 6. BACKTEST COUNTERS
+// ═══════════════════════════════════════════════════════════
+
+var int   tot              = 0
+var int   wins             = 0
+var int   current_streak   = 0
+var int   max_loss_streak  = 0
+var int   max_win_streak   = 0
+var int   current_win_streak = 0
+
+var array<int> recent_results = array.new_int()
+var int        recent_sum     = 0
+
+var float cum_pnl_flat = 0.0
+
+var float brier_sum = 0.0
+var int   brier_cnt = 0
+// green prev bar  → LONG
+var int gl_bets = 0
+var int gl_wins = 0
+// green prev bar → SHORT
+var int gs_bets = 0
+var int gs_wins = 0
+// red prev bar → LONG
+var int rl_bets = 0
+var int rl_wins = 0
+// red prev bar → SHORT
+var int rs_bets = 0
+var int rs_wins = 0
+
+// Win rate by volatility regime (LL=0, LH=1, HL=2, HH=3)
+var array<int> reg_bets = array.new_int(4, 0)
+var array<int> reg_wins = array.new_int(4, 0)
+
+// Track the PREVIOUS bar's preview signal & regime for backtest accuracy
+// (since that's what actually executed as a trade on THIS bar)
+var bool   prev_pv_bet        = false
+var string prev_pv_dir        = na
+var float  prev_pv_prob       = na
+var int    prev_pv_rt         = na
+
+if barstate.isconfirmed and bar_index > 4
+
+    // Update Markov counters
+    float w = bar_weight
+    array.set(C_n, si, array.get(C_n, si) + w)
+    if went_up
+        array.set(C_h, si, array.get(C_h, si) + w)
+    if enable_regime and enable_regime_tx
+        array.set(RT_n, rti, array.get(RT_n, rti) + w)
+        if went_up
+            array.set(RT_h, rti, array.get(RT_h, rti) + w)
+
+    // Count the PREVIOUS bar's preview signal if it placed a trade on THIS bar
+    if prev_pv_bet
+        tot += 1
+        bool is_long = prev_pv_dir == "LONG"
+        bool correct = (is_long and went_up) or (not is_long and went_down)
+
+        if correct
+            wins += 1
+            current_streak     := 0
+            current_win_streak += 1
+            if current_win_streak > max_win_streak
+                max_win_streak := current_win_streak
+        else
+            current_win_streak := 0
+            current_streak     += 1
+            if current_streak > max_loss_streak
+                max_loss_streak := current_streak
+
+        int rr_val = correct ? 1 : 0
+        array.push(recent_results, rr_val)
+        recent_sum += rr_val
+        if array.size(recent_results) > wr_window
+            int removed = array.shift(recent_results)
+            recent_sum -= removed
+
+        cum_pnl_flat += correct ? 1.0 : -1.0
+
+        float p_fc    = prev_pv_prob / 100.0
+        float outcome = correct ? 1.0 : 0.0
+        brier_sum += (p_fc - outcome) * (p_fc - outcome)
+        brier_cnt += 1
+
+        // Track by previous bar colour × signal direction (THIS bar's close vs PREVIOUS bar's close)
+        bool prev_green = close[1] > close[2]
+        bool prev_red   = close[1] < close[2]
+        if prev_green
+            if is_long
+                gl_bets += 1
+                if correct
+                    gl_wins += 1
+            else
+                gs_bets += 1
+                if correct
+                    gs_wins += 1
+        else if prev_red
+            if is_long
+                rl_bets += 1
+                if correct
+                    rl_wins += 1
+            else
+                rs_bets += 1
+                if correct
+                    rs_wins += 1
+
+        // Track by regime (prev_pv_rt: LL=0, LH=1, HL=2, HH=3)
+        if not na(prev_pv_rt)
+            array.set(reg_bets, prev_pv_rt, array.get(reg_bets, prev_pv_rt) + 1)
+            if correct
+                array.set(reg_wins, prev_pv_rt, array.get(reg_wins, prev_pv_rt) + 1)
+
+    // Store THIS bar's preview for use on NEXT bar
+    prev_pv_bet := pv_bet
+    prev_pv_dir := pv_dir
+    prev_pv_prob := pv_prob
+    prev_pv_rt := pv_rt
+
+// Aggregate stats
+float wr         = tot > 0 ? wins * 100.0 / tot : 0.0
+float rolling_wr = array.size(recent_results) > 0 ? recent_sum * 100.0 / array.size(recent_results) : na
+float brier      = brier_cnt > 0 ? brier_sum / brier_cnt : na
+
+// Regime win rates
+float wr_ll = array.get(reg_bets, 0) > 0 ? array.get(reg_wins, 0) * 100.0 / array.get(reg_bets, 0) : na
+float wr_lh = array.get(reg_bets, 1) > 0 ? array.get(reg_wins, 1) * 100.0 / array.get(reg_bets, 1) : na
+float wr_hl = array.get(reg_bets, 2) > 0 ? array.get(reg_wins, 2) * 100.0 / array.get(reg_bets, 2) : na
+float wr_hh = array.get(reg_bets, 3) > 0 ? array.get(reg_wins, 3) * 100.0 / array.get(reg_bets, 3) : na
+
+// After-bar-color win rates
+float wr_gl = gl_bets > 0 ? gl_wins * 100.0 / gl_bets : na
+float wr_gs = gs_bets > 0 ? gs_wins * 100.0 / gs_bets : na
+float wr_rl = rl_bets > 0 ? rl_wins * 100.0 / rl_bets : na
+float wr_rs = rs_bets > 0 ? rs_wins * 100.0 / rs_bets : na
+
+// ═══════════════════════════════════════════════════════════
+// 7. REGIME BACKGROUND + CHART SIGNALS
+// ═══════════════════════════════════════════════════════════
+
+// Four regimes — each gets a distinct background tint (shown on every bar)
+// LL (Low→Low)   = blue
+// LH (Low→High)  = green
+// HL (High→Low)  = orange
+// HH (High→High) = red
+color regime_bg = switch rt
+    0 => color.new(color.blue,   88)
+    1 => color.new(color.green,  88)
+    2 => color.new(color.orange, 88)
+    3 => color.new(color.red,    88)
+    => na
+
+bgcolor(show_regime_bg ? regime_bg : na, title="Regime Background")
+bgcolor(show_vol_exp_bg and not allow_trade_vol ? color.new(color.fuchsia, 85) : na,
+     title="Volume Expansion Block")
+
+bool long_bet  = bet and dir == "LONG"
+bool short_bet = bet and dir == "SHORT"
+bool long_signal  = show_arrows and long_bet
+bool short_signal = show_arrows and short_bet
+
+// -----------------------------------------------------------
+// 7b. STRATEGY EXECUTION (SL/TP-ONLY EXITS)
+// Entry: preview signal on bar N close → fills at bar N+1 open
+// Exit:  ONLY via stop loss (1× ATR) or take profit (1.2× ATR)
+// No end-of-bar close — position stays open until SL or TP hits.
+// If a new signal fires in the opposite direction, strategy.entry
+// auto-reverses (pyramiding=0).  Same direction = no-op.
+// -----------------------------------------------------------
+
+bool pv_long  = pv_bet and pv_dir == "LONG"
+bool pv_short = pv_bet and pv_dir == "SHORT"
+
+if barstate.isconfirmed and bar_index > 4
+    // Queue next bar's entry from preview signal → fills at next bar's open
+    if pv_long
+        strategy.entry("L", strategy.long)
+        strategy.exit("L-exit", "L", loss=sl_atr_mult * atr_v / syminfo.mintick, profit=tp_atr_mult * atr_v / syminfo.mintick)
+    else if pv_short
+        strategy.entry("S", strategy.short)
+        strategy.exit("S-exit", "S", loss=sl_atr_mult * atr_v / syminfo.mintick, profit=tp_atr_mult * atr_v / syminfo.mintick)
+
+plotshape(long_signal,
+     title="LONG",  style=shape.triangleup,
+     location=location.belowbar, color=color.green, size=size.tiny)
+plotshape(short_signal,
+     title="SHORT", style=shape.triangledown,
+     location=location.abovebar, color=color.red,   size=size.tiny)
+
+alertcondition(long_signal,  title="Polymarket LONG",  message="Polymarket-7.4.1: LONG signal")
+alertcondition(short_signal, title="Polymarket SHORT", message="Polymarket-7.4.1: SHORT signal")
+
+// ═══════════════════════════════════════════════════════════
+// 8. STATISTICS TABLE
+// ═══════════════════════════════════════════════════════════
+
+// Helper: format winrate with sample count
+wr_cell(float w, int b) =>
+    b > 0 ? str.tostring(w, "#.##") + "% (" + str.tostring(b) + ")" : "-"
+
+var table panel = table.new(position.top_right, 2, 48,
+     frame_color=color.new(color.gray, 50), frame_width=2,
+     border_color=chart.bg_color, border_width=1)
+
+if barstate.islast and show_stats
+    int r = 0
+
+    // Header
+    table.cell(panel, 0, r, "📊 7.4.1-S-MR-3O-R",
+         bgcolor=color.new(color.blue, 70), text_color=color.white,
+         text_halign=text.align_center, text_size=size.large)
+    table.cell(panel, 1, r, "",
+         bgcolor=color.new(color.blue, 70))
+    r += 1
+
+    // Overall win rate
+    color wrc = wr >= 56 ? color.green : wr >= 53 ? color.orange : color.red
+    table.cell(panel, 0, r, "🎯 Win Rate",
+         bgcolor=chart.bg_color, text_color=chart.fg_color,
+         text_halign=text.align_left, text_size=size.large)
+    table.cell(panel, 1, r, str.tostring(wr, "#.##") + "%",
+         bgcolor=chart.bg_color, text_color=wrc,
+         text_halign=text.align_right, text_size=size.large)
+    r += 1
+
+    table.cell(panel, 0, r, "Total Bets",
+         bgcolor=chart.bg_color, text_color=chart.fg_color,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, str.tostring(tot),
+         bgcolor=chart.bg_color, text_color=chart.fg_color,
+         text_halign=text.align_right, text_size=size.large)
+    r += 1
+
+    table.cell(panel, 0, r, "W / L",
+         bgcolor=chart.bg_color, text_color=chart.fg_color,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r,
+         str.tostring(wins) + " / " + str.tostring(tot - wins),
+         bgcolor=chart.bg_color, text_color=chart.fg_color,
+         text_halign=text.align_right, text_size=size.large)
+    r += 1
+
+    table.cell(panel, 0, r, "Rolling WR (last " + str.tostring(wr_window) + ")",
+         bgcolor=chart.bg_color, text_color=chart.fg_color,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, not na(rolling_wr) ? str.tostring(rolling_wr, "#.##") + "%" : "-",
+         bgcolor=chart.bg_color, text_color=chart.fg_color,
+         text_halign=text.align_right, text_size=size.large)
+    r += 1
+
+    color pnl_c = cum_pnl_flat > 0 ? color.green : cum_pnl_flat < 0 ? color.red : chart.fg_color
+    table.cell(panel, 0, r, "P/L (flat)",
+         bgcolor=chart.bg_color, text_color=chart.fg_color,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r,
+         (cum_pnl_flat >= 0 ? "+" : "") + str.tostring(cum_pnl_flat, "#.#") + "u",
+         bgcolor=chart.bg_color, text_color=pnl_c,
+         text_halign=text.align_right, text_size=size.large)
+    r += 1
+
+    color bc = na(brier) ? color.gray : brier < 0.22 ? color.green : brier < 0.25 ? color.orange : color.red
+    table.cell(panel, 0, r, "Brier Score",
+         bgcolor=chart.bg_color, text_color=chart.fg_color,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r,
+         not na(brier) ? str.tostring(brier, "#.####") : "-",
+         bgcolor=chart.bg_color, text_color=bc,
+         text_halign=text.align_right, text_size=size.large)
+    r += 1
+
+    table.cell(panel, 0, r, "Max Loss Streak",
+         bgcolor=chart.bg_color, text_color=color.red,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, str.tostring(max_loss_streak),
+         bgcolor=chart.bg_color, text_color=color.red,
+         text_halign=text.align_right, text_size=size.large)
+    r += 1
+
+    table.cell(panel, 0, r, "Max Win Streak",
+         bgcolor=chart.bg_color, text_color=color.green,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, str.tostring(max_win_streak),
+         bgcolor=chart.bg_color, text_color=color.green,
+         text_halign=text.align_right, text_size=size.large)
+    r += 1
+
+    // ── After Previous Bar Colour ──────────────────────────
+    table.cell(panel, 0, r, "── After Prev Bar ──",
+         bgcolor=chart.bg_color, text_color=color.gray,
+         text_halign=text.align_left, text_size=size.small)
+    table.cell(panel, 1, r, "",
+         bgcolor=chart.bg_color)
+    r += 1
+
+    table.cell(panel, 0, r, "🟢 Bar → LONG",
+         bgcolor=chart.bg_color, text_color=color.green,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, wr_cell(wr_gl, gl_bets),
+         bgcolor=chart.bg_color, text_color=color.green,
+         text_halign=text.align_right, text_size=size.normal)
+    r += 1
+
+    table.cell(panel, 0, r, "🟢 Bar → SHORT",
+         bgcolor=chart.bg_color, text_color=color.green,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, wr_cell(wr_gs, gs_bets),
+         bgcolor=chart.bg_color, text_color=color.green,
+         text_halign=text.align_right, text_size=size.normal)
+    r += 1
+
+    table.cell(panel, 0, r, "🔴 Bar → LONG",
+         bgcolor=chart.bg_color, text_color=color.red,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, wr_cell(wr_rl, rl_bets),
+         bgcolor=chart.bg_color, text_color=color.red,
+         text_halign=text.align_right, text_size=size.normal)
+    r += 1
+
+    table.cell(panel, 0, r, "🔴 Bar → SHORT",
+         bgcolor=chart.bg_color, text_color=color.red,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, wr_cell(wr_rs, rs_bets),
+         bgcolor=chart.bg_color, text_color=color.red,
+         text_halign=text.align_right, text_size=size.normal)
+    r += 1
+
+    // ── WR by Volatility Regime ────────────────────────────
+    table.cell(panel, 0, r, "── WR by Regime ──",
+         bgcolor=chart.bg_color, text_color=color.gray,
+         text_halign=text.align_left, text_size=size.small)
+    table.cell(panel, 1, r, "",
+         bgcolor=chart.bg_color)
+    r += 1
+
+    // LL = blue
+    table.cell(panel, 0, r, "🔵 LL  Low→Low",
+         bgcolor=color.new(color.blue,   88), text_color=chart.fg_color,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, wr_cell(wr_ll, array.get(reg_bets, 0)),
+         bgcolor=color.new(color.blue,   88), text_color=chart.fg_color,
+         text_halign=text.align_right, text_size=size.normal)
+    r += 1
+
+    // LH = green
+    table.cell(panel, 0, r, "🟢 LH  Low→High",
+         bgcolor=color.new(color.green,  88), text_color=chart.fg_color,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, wr_cell(wr_lh, array.get(reg_bets, 1)),
+         bgcolor=color.new(color.green,  88), text_color=chart.fg_color,
+         text_halign=text.align_right, text_size=size.normal)
+    r += 1
+
+    // HL = orange
+    table.cell(panel, 0, r, "🟠 HL  High→Low",
+         bgcolor=color.new(color.orange, 88), text_color=chart.fg_color,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, wr_cell(wr_hl, array.get(reg_bets, 2)),
+         bgcolor=color.new(color.orange, 88), text_color=chart.fg_color,
+         text_halign=text.align_right, text_size=size.normal)
+    r += 1
+
+    // HH = red
+    table.cell(panel, 0, r, "🔴 HH  High→High",
+         bgcolor=color.new(color.red,    88), text_color=chart.fg_color,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, wr_cell(wr_hh, array.get(reg_bets, 3)),
+         bgcolor=color.new(color.red,    88), text_color=chart.fg_color,
+         text_halign=text.align_right, text_size=size.normal)
+    r += 1
+
+    // Active winrate threshold
+    table.cell(panel, 0, r, "Active WR Thresh",
+         bgcolor=chart.bg_color, text_color=color.fuchsia,
+         text_halign=text.align_left, text_size=size.normal)
+    table.cell(panel, 1, r, str.tostring(effective_min_wr, "#.#") + "%",
+         bgcolor=chart.bg_color, text_color=color.fuchsia,
+         text_halign=text.align_right, text_size=size.normal)
+    r += 1
+
+    // Live prediction
+    if bet
+        table.cell(panel, 0, r, "🎯 LIVE BET",
+             bgcolor=color.new(color.orange, 70), text_color=color.white,
+             text_halign=text.align_center, text_size=size.normal)
+        table.cell(panel, 1, r, "",
+             bgcolor=color.new(color.orange, 70))
+        r += 1
+
+        color pc = dir == "LONG" ? color.green : color.red
+        string pe = dir == "LONG" ? "📈" : "📉"
+        table.cell(panel, 0, r, pe + " " + dir,
+             bgcolor=chart.bg_color, text_color=pc,
+             text_halign=text.align_left, text_size=size.large)
+        table.cell(panel, 1, r, str.tostring(prob, "#.#") + "%",
+             bgcolor=chart.bg_color, text_color=pc,
+             text_halign=text.align_right, text_size=size.large)
+        r += 1
+
+        array<string> rt_labels = array.from("LL", "LH", "HL", "HH")
+        string rt_lbl  = enable_regime_tx and enable_regime ? array.get(rt_labels, rt) : "--"
+        string wil_str = enable_wilson ? " W=" + str.tostring(wilson_lb, "#.#") : ""
+        table.cell(panel, 0, r, "Seq/Regime",
+             bgcolor=chart.bg_color, text_color=chart.fg_color,
+             text_halign=text.align_left, text_size=size.small)
+        table.cell(panel, 1, r,
+             str.tostring(si) + "/" + rt_lbl + " N=" + str.tostring(eN, "#") + wil_str,
+             bgcolor=chart.bg_color, text_color=color.aqua,
+             text_halign=text.align_right, text_size=size.normal)
+    else
+        table.cell(panel, 0, r, "⏸ NO BET",
+             bgcolor=color.new(color.gray, 70), text_color=color.white,
+             text_halign=text.align_center, text_size=size.normal)
+        table.cell(panel, 1, r, "",
+             bgcolor=color.new(color.gray, 70))
+        r += 1
+
+        string reason = ""
+        if not ok_n
+            reason := "Low samples"
+        else if not ok_wr
+            reason := enable_wilson ? "Wilson < " + str.tostring(effective_min_wr, "#.##") : "Low winrate"
+        else if not ok_vol
+            reason := "Low volume"
+        else if not allow_trade_vol
+            reason := "Vol expansion"
+        else
+            reason := "No signal"
+        table.cell(panel, 0, r, "Reason",
+             bgcolor=chart.bg_color, text_color=chart.fg_color,
+             text_halign=text.align_left, text_size=size.normal)
+        table.cell(panel, 1, r, reason,
+             bgcolor=chart.bg_color, text_color=color.orange,
+             text_halign=text.align_right, text_size=size.normal)
+    r += 1
+
+    // ── NEXT-BAR PREVIEW ──────────────────────────────────
+    if show_preview
+        table.cell(panel, 0, r, "── Next-Bar Preview ──",
+             bgcolor=color.new(color.purple, 70), text_color=color.white,
+             text_halign=text.align_center, text_size=size.normal)
+        table.cell(panel, 1, r, "",
+             bgcolor=color.new(color.purple, 70))
+        r += 1
+
+        array<string> pv_rt_labels = array.from("LL", "LH", "HL", "HH")
+        string pv_rt_lbl = enable_regime_tx and enable_regime ? array.get(pv_rt_labels, pv_rt) : "--"
+
+        if pv_bet
+            color pv_pc = pv_dir == "LONG" ? color.green : color.red
+            string pv_pe = pv_dir == "LONG" ? "📈" : "📉"
+            table.cell(panel, 0, r, pv_pe + " " + pv_dir,
+                 bgcolor=chart.bg_color, text_color=pv_pc,
+                 text_halign=text.align_left, text_size=size.large)
+            table.cell(panel, 1, r, str.tostring(pv_prob, "#.#") + "%",
+                 bgcolor=chart.bg_color, text_color=pv_pc,
+                 text_halign=text.align_right, text_size=size.large)
+            r += 1
+
+            // P(up) and P(down) for the next bar
+            table.cell(panel, 0, r, "P(up) / P(down)",
+                 bgcolor=chart.bg_color, text_color=chart.fg_color,
+                 text_halign=text.align_left, text_size=size.small)
+            table.cell(panel, 1, r,
+                 str.tostring(pv_eH, "#.#") + " / " + str.tostring(pv_eL, "#.#"),
+                 bgcolor=chart.bg_color, text_color=color.aqua,
+                 text_halign=text.align_right, text_size=size.normal)
+            r += 1
+
+            string pv_wil_str = enable_wilson ? " W=" + str.tostring(pv_wilson_lb, "#.#") : ""
+            table.cell(panel, 0, r, "Seq/Regime",
+                 bgcolor=chart.bg_color, text_color=chart.fg_color,
+                 text_halign=text.align_left, text_size=size.small)
+            table.cell(panel, 1, r,
+                 str.tostring(pv_si) + "/" + pv_rt_lbl + " N=" + str.tostring(pv_eN, "#") + pv_wil_str,
+                 bgcolor=chart.bg_color, text_color=color.aqua,
+                 text_halign=text.align_right, text_size=size.normal)
+        else
+            table.cell(panel, 0, r, "⏸ NO BET",
+                 bgcolor=chart.bg_color, text_color=color.gray,
+                 text_halign=text.align_left, text_size=size.normal)
+            table.cell(panel, 1, r, pv_no_reason,
+                 bgcolor=chart.bg_color, text_color=color.orange,
+                 text_halign=text.align_right, text_size=size.normal)
+            r += 1
+
+            // Still show P(up) / P(down) even when no bet
+            table.cell(panel, 0, r, "P(up) / P(down)",
+                 bgcolor=chart.bg_color, text_color=chart.fg_color,
+                 text_halign=text.align_left, text_size=size.small)
+            table.cell(panel, 1, r,
+                 str.tostring(nz(pv_eH, 50.0), "#.#") + " / " + str.tostring(nz(pv_eL, 50.0), "#.#"),
+                 bgcolor=chart.bg_color, text_color=color.gray,
+                 text_halign=text.align_right, text_size=size.normal)
+            r += 1
+
+            table.cell(panel, 0, r, "Seq/Regime",
+                 bgcolor=chart.bg_color, text_color=chart.fg_color,
+                 text_halign=text.align_left, text_size=size.small)
+            table.cell(panel, 1, r,
+                 str.tostring(pv_si) + "/" + pv_rt_lbl + " N=" + str.tostring(pv_eN, "#"),
+                 bgcolor=chart.bg_color, text_color=color.gray,
+                 text_halign=text.align_right, text_size=size.normal)
